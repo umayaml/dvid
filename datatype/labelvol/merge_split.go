@@ -173,9 +173,12 @@ func (d *Data) MergeLabels(v dvid.VersionID, m labels.MergeOp) error {
 	return nil
 }
 
-// SplitLabels splits a portion of a label's voxels into a new label, which is returned.
-// The input is a binary sparse volume and should preferably be the smaller portion of a labeled region.
-// In other words, the caller should chose to submit for relabeling the smaller portion of any split.
+// SplitLabels splits a portion of a label's voxels into a given split label or, if the given split
+// label is 0, a new label, which is returned.  The input is a binary sparse volume and should
+// preferably be the smaller portion of a labeled region.  In other words, the caller should chose
+// to submit for relabeling the smaller portion of any split.  It is assumed that the given split
+// voxels are within the fromLabel set of voxels and will generate unspecified behavior if this is
+// not the case.
 //
 // EVENTS
 //
@@ -185,7 +188,7 @@ func (d *Data) MergeLabels(v dvid.VersionID, m labels.MergeOp) error {
 //
 // labels.SplitEndEvent occurs at end of split and transmits labels.DeltaSplitEnd struct.
 //
-func (d *Data) SplitLabels(v dvid.VersionID, fromLabel uint64, r io.ReadCloser) (toLabel uint64, err error) {
+func (d *Data) SplitLabels(v dvid.VersionID, fromLabel, splitLabel uint64, r io.ReadCloser) (toLabel uint64, err error) {
 	store, err := storage.MutableStore()
 	if err != nil {
 		err = fmt.Errorf("Data type labelvol had error initializing store: %v\n", err)
@@ -203,11 +206,16 @@ func (d *Data) SplitLabels(v dvid.VersionID, fromLabel uint64, r io.ReadCloser) 
 	defer dirtyLabels.Decr(iv, fromLabel)
 
 	// Create a new label id for this version that will persist to store
-	toLabel, err = d.NewLabel(v)
-	if err != nil {
-		return
+	if splitLabel != 0 {
+		toLabel = splitLabel
+		dvid.Debugf("Splitting subset of label %d into given label %d ...\n", fromLabel, splitLabel)
+	} else {
+		toLabel, err = d.NewLabel(v)
+		if err != nil {
+			return
+		}
+		dvid.Debugf("Splitting subset of label %d into new label %d ...\n", fromLabel, toLabel)
 	}
-	dvid.Debugf("Splitting subset of label %d into label %d ...\n", fromLabel, toLabel)
 
 	// Signal that we are starting a split.
 	evt := datastore.SyncEvent{d.DataName(), labels.SplitStartEvent}
@@ -249,7 +257,7 @@ func (d *Data) SplitLabels(v dvid.VersionID, fromLabel uint64, r io.ReadCloser) 
 	// Iterate through the split blocks, read the original block.  If the RLEs
 	// are identical, just delete the original.  If not, modify the original.
 	// TODO: Modifications should be transactional since it's GET-PUT, therefore use
-	// hash on block coord to direct it to block-specific goroutine; we serialize
+	// hash on block coord to direct it to blockLabel, splitLabel-specific goroutine; we serialize
 	// requests to handle concurrency.
 	ctx := datastore.NewVersionedCtx(d, v)
 	batch := batcher.NewBatch(ctx)
@@ -322,9 +330,9 @@ func (d *Data) SplitLabels(v dvid.VersionID, fromLabel uint64, r io.ReadCloser) 
 	return toLabel, nil
 }
 
-// SplitCoarseLabels splits a portion of a label's voxels into a new label, which is returned.
-// The input is a binary sparse volume defined by block coordinates and should be the smaller portion
-// of a labeled region-to-be-split.
+// SplitCoarseLabels splits a portion of a label's voxels into a given split label or, if the given split
+// label is 0, a new label, which is returned.  The input is a binary sparse volume defined by block
+// coordinates and should be the smaller portion of a labeled region-to-be-split.
 //
 // EVENTS
 //
@@ -334,7 +342,7 @@ func (d *Data) SplitLabels(v dvid.VersionID, fromLabel uint64, r io.ReadCloser) 
 //
 // labels.SplitEndEvent occurs at end of split and transmits labels.DeltaSplitEnd struct.
 //
-func (d *Data) SplitCoarseLabels(v dvid.VersionID, fromLabel uint64, r io.ReadCloser) (toLabel uint64, err error) {
+func (d *Data) SplitCoarseLabels(v dvid.VersionID, fromLabel, splitLabel uint64, r io.ReadCloser) (toLabel uint64, err error) {
 	store, err := storage.MutableStore()
 	if err != nil {
 		err = fmt.Errorf("Data type labelvol had error initializing store: %v\n", err)
@@ -352,11 +360,16 @@ func (d *Data) SplitCoarseLabels(v dvid.VersionID, fromLabel uint64, r io.ReadCl
 	defer dirtyLabels.Decr(iv, fromLabel)
 
 	// Create a new label id for this version that will persist to store
-	toLabel, err = d.NewLabel(v)
-	if err != nil {
-		return
+	if splitLabel != 0 {
+		toLabel = splitLabel
+		dvid.Debugf("Splitting coarse subset of label %d into given label %d ...\n", fromLabel, splitLabel)
+	} else {
+		toLabel, err = d.NewLabel(v)
+		if err != nil {
+			return
+		}
+		dvid.Debugf("Splitting coarse subset of label %d into new label %d ...\n", fromLabel, toLabel)
 	}
-	dvid.Debugf("Splitting coarse subset of label %d into label %d ...\n", fromLabel, toLabel)
 
 	// Signal that we are starting a split.
 	evt := datastore.SyncEvent{d.DataName(), labels.SplitStartEvent}
@@ -410,7 +423,7 @@ func (d *Data) SplitCoarseLabels(v dvid.VersionID, fromLabel uint64, r io.ReadCl
 			return toLabel, err
 		}
 		if val == nil {
-			continue // There isn't any label in this splitblk, so just skip it.
+			return toLabel, fmt.Errorf("Split block %s is not part of original label %d", splitblk.Print(), fromLabel)
 		}
 		var rles dvid.RLEs
 		if err := rles.UnmarshalBinary(val); err != nil {

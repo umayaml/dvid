@@ -62,10 +62,10 @@ $ dvid repo <UUID> new labelvol <data name> <settings...>
 
     Configuration Settings (case-insensitive keys)
 
+    Sync           Name of labelblk data to which this labelvol data should be synced.
     BlockSize      Size in pixels  (default: %s)
     VoxelSize      Resolution of voxels (default: 8.0, 8.0, 8.0)
     VoxelUnits     Resolution units (default: "nanometers")
-	
 	
     ------------------
 
@@ -226,9 +226,10 @@ POST <api URL>/node/<UUID>/<data name>/merge
 	same toLabel as a single merge request instead of multiple merge requests.
 
 
-POST <api URL>/node/<UUID>/<data name>/split/<label>
+POST <api URL>/node/<UUID>/<data name>/split/<label>[?splitlabel=X]
 
-	Splits a portion of a label's voxels into a new label.  Returns the following JSON:
+	Splits a portion of a label's voxels into a new label or, if "splitlabel" is specified
+	as an optional query string, the given split label.  Returns the following JSON:
 
 		{ "label": <new label> }
 
@@ -252,9 +253,18 @@ POST <api URL>/node/<UUID>/<data name>/split/<label>
 			  ...
 	        int32   Length of run
 
-POST <api URL>/node/<UUID>/<data name>/split-coarse/<label>
+	NOTE 1: The POSTed split sparse volume must be a subset of the given label's voxels.  You cannot
+	give an arbitrary sparse volume that may span multiple labels.
 
-	Splits a blocks of a label's voxels into a new label.  Returns the following JSON:
+	NOTE 2: If a split label is specified, it is the client's responsibility to make sure the given
+	label will not create conflict with labels in other versions.  It should primarily be used in
+	chain operations like "split-coarse" followed by "split" using voxels, where the new label
+	created by the split coarse is used as the split label for the smaller, higher-res "split".
+
+POST <api URL>/node/<UUID>/<data name>/split-coarse/<label>[?splitlabel=X]
+
+	Splits a portion of a label's blocks into a new label or, if "splitlabel" is specified
+	as an optional query string, the given split label.  Returns the following JSON:
 
 		{ "label": <new label> }
 
@@ -278,6 +288,7 @@ POST <api URL>/node/<UUID>/<data name>/split-coarse/<label>
 			  ...
 	        int32   Length of run
 
+	The Notes for "split" endpoint above are applicable to this "split-coarse" endpoint.
 `
 
 var (
@@ -789,7 +800,7 @@ func (d *Data) ServeHTTP(uuid dvid.UUID, ctx *datastore.VersionedCtx, w http.Res
 			server.BadRequest(w, r, "Label 0 is protected background value and cannot be used as sparse volume.\n")
 			return
 		}
-		queryValues := r.URL.Query()
+		queryStrings := r.URL.Query()
 		var b Bounds
 		b.VoxelBounds, err = dvid.BoundsFromQueryString(r)
 		if err != nil {
@@ -798,11 +809,11 @@ func (d *Data) ServeHTTP(uuid dvid.UUID, ctx *datastore.VersionedCtx, w http.Res
 		}
 		b.BlockBounds = b.VoxelBounds.Divide(d.BlockSize)
 		b.Exact = true
-		if queryValues.Get("exact") == "false" {
+		if queryStrings.Get("exact") == "false" {
 			b.Exact = false
 		}
 
-		compression := queryValues.Get("compression")
+		compression := queryStrings.Get("compression")
 
 		switch action {
 		case "get":
@@ -979,7 +990,7 @@ func (d *Data) ServeHTTP(uuid dvid.UUID, ctx *datastore.VersionedCtx, w http.Res
 		timedLog.Infof("HTTP maxlabel request (%s)", r.URL)
 
 	case "split":
-		// POST <api URL>/node/<UUID>/<data name>/split/<label>
+		// POST <api URL>/node/<UUID>/<data name>/split/<label>[?splitlabel=X]
 		if action != "post" {
 			server.BadRequest(w, r, "Split requests must be POST actions.")
 			return
@@ -997,7 +1008,16 @@ func (d *Data) ServeHTTP(uuid dvid.UUID, ctx *datastore.VersionedCtx, w http.Res
 			server.BadRequest(w, r, "Label 0 is protected background value and cannot be used as sparse volume.\n")
 			return
 		}
-		toLabel, err := d.SplitLabels(ctx.VersionID(), fromLabel, r.Body)
+		var splitLabel uint64
+		queryStrings := r.URL.Query()
+		splitStr := queryStrings.Get("splitlabel")
+		if splitStr != "" {
+			splitLabel, err = strconv.ParseUint(splitStr, 10, 64)
+			if err != nil {
+				server.BadRequest(w, r, "Bad parameter for 'splitlabel' query string (%q).  Must be uint64.\n", splitStr)
+			}
+		}
+		toLabel, err := d.SplitLabels(ctx.VersionID(), fromLabel, splitLabel, r.Body)
 		if err != nil {
 			server.BadRequest(w, r, fmt.Sprintf("split: %v", err))
 			return
@@ -1007,7 +1027,7 @@ func (d *Data) ServeHTTP(uuid dvid.UUID, ctx *datastore.VersionedCtx, w http.Res
 		timedLog.Infof("HTTP split request (%s)", r.URL)
 
 	case "split-coarse":
-		// POST <api URL>/node/<UUID>/<data name>/split-coarse/<label>
+		// POST <api URL>/node/<UUID>/<data name>/split-coarse/<label>[?splitlabel=X]
 		if action != "post" {
 			server.BadRequest(w, r, "Split-coarse requests must be POST actions.")
 			return
@@ -1025,7 +1045,16 @@ func (d *Data) ServeHTTP(uuid dvid.UUID, ctx *datastore.VersionedCtx, w http.Res
 			server.BadRequest(w, r, "Label 0 is protected background value and cannot be used as sparse volume.\n")
 			return
 		}
-		toLabel, err := d.SplitCoarseLabels(ctx.VersionID(), fromLabel, r.Body)
+		var splitLabel uint64
+		queryStrings := r.URL.Query()
+		splitStr := queryStrings.Get("splitlabel")
+		if splitStr != "" {
+			splitLabel, err = strconv.ParseUint(splitStr, 10, 64)
+			if err != nil {
+				server.BadRequest(w, r, "Bad parameter for 'splitlabel' query string (%q).  Must be uint64.\n", splitStr)
+			}
+		}
+		toLabel, err := d.SplitCoarseLabels(ctx.VersionID(), fromLabel, splitLabel, r.Body)
 		if err != nil {
 			server.BadRequest(w, r, fmt.Sprintf("split-coarse: %v", err))
 			return
@@ -1130,10 +1159,14 @@ func (d *Data) NewLabel(v dvid.VersionID) (uint64, error) {
 	buf := make([]byte, 8)
 	binary.LittleEndian.PutUint64(buf, d.MaxRepoLabel)
 	ctx := datastore.NewVersionedCtx(d, v)
-	store.Put(ctx, maxLabelTKey, buf)
+	if err := store.Put(ctx, maxLabelTKey, buf); err != nil {
+		return 0, err
+	}
 
 	ctx2 := storage.NewDataContext(d, 0)
-	store.Put(ctx2, maxRepoLabelTKey, buf)
+	if err := store.Put(ctx2, maxRepoLabelTKey, buf); err != nil {
+		return 0, err
+	}
 
 	return d.MaxRepoLabel, nil
 }

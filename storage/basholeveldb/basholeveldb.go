@@ -724,7 +724,7 @@ func (db *LevelDB) ProcessRange(ctx storage.Context, kStart, kEnd storage.TKey, 
 		if result.error != nil {
 			return result.error
 		}
-		if op.Wg != nil {
+		if op != nil && op.Wg != nil {
 			op.Wg.Add(1)
 		}
 		tk, err := ctx.TKeyFromKey(result.KeyValue.K)
@@ -1197,8 +1197,6 @@ func (batch *goBatch) Put(tk storage.TKey, v []byte) {
 		tombstone := batch.vctx.TombstoneKey(tk) // This will now have current version
 		batch.WriteBatch.Delete(tombstone)
 	}
-	batch.WriteBatch.Put(key, v)
-
 	storage.StoreKeyBytesWritten <- len(key)
 	storage.StoreValueBytesWritten <- len(v)
 	batch.WriteBatch.Put(key, v)

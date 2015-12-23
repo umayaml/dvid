@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"image"
+	"io"
 	"io/ioutil"
 	"net/http"
 	"strconv"
@@ -22,7 +23,6 @@ import (
 	"github.com/janelia-flyem/dvid/datastore"
 	"github.com/janelia-flyem/dvid/datatype/common/labels"
 	"github.com/janelia-flyem/dvid/datatype/imageblk"
-	"github.com/janelia-flyem/dvid/datatype/roi"
 	"github.com/janelia-flyem/dvid/dvid"
 	"github.com/janelia-flyem/dvid/message"
 	"github.com/janelia-flyem/dvid/server"
@@ -64,7 +64,7 @@ $ dvid repo <UUID> new labelblk <data name> <settings...>
 
     Configuration Settings (case-insensitive keys)
 
-    Sync           Name of preexisting labelvol or labeltile data
+    Sync           Name of labelvol data that should sync with this labelblk data.
     LabelType      "standard" (default) or "raveler" 
     BlockSize      Size in pixels  (default: %s)
     VoxelSize      Resolution of voxels (default: 8.0, 8.0, 8.0)
@@ -144,29 +144,26 @@ GET  <api URL>/node/<UUID>/<data name>/metadata
 	of bytes returned for n-d images.
 
 
-GET  <api URL>/node/<UUID>/<data name>/raw/<dims>/<size>/<offset>[/<format>][?throttle=true,compression=...]
-GET  <api URL>/node/<UUID>/<data name>/isotropic/<dims>/<size>/<offset>[/<format>][?throttle=true,compression=...]
-POST <api URL>/node/<UUID>/<data name>/raw/<dims>/<size>/<offset>[/<format>][?throttle=true,compression=...]
+GET  <api URL>/node/<UUID>/<data name>/isotropic/<dims>/<size>/<offset>[/<format>][?queryopts]
 
-    Retrieves or puts label data as either a 2D PNG or a 3D binary blob depending on the
-    dims parameter.  The 2D PNG uses RGBA images with 16 bits per channel.  Binary data is simply
-    packed 64-bit data with "Content-type" of the HTTP response set to 
-    "application/octet-stream".  See 'voxels' API for discussion of 'raw' versus 'isotropic'
+    Retrieves either 2d images (PNG by default) or 3d binary data, depending on the dims parameter.  
+    The 3d binary data response has "Content-type" set to "application/octet-stream" and is an array of 
+    voxel values in ZYX order (X iterates most rapidly).
 
-    NOTE on POST: All POSTed data must be block-aligned using the block sizes defined for 
-    this data instance.  For example, if the BlockSize = 32, offset and size must by
-    multiples of 32.
     Example: 
 
-    GET <api URL>/node/3f8c/segmentation/0_1/512_256/0_0_100
+    GET <api URL>/node/3f8c/segmentation/isotropic/0_1/512_256/0_0_100/jpg:80
 
-    Returns an XY slice (0th and 1st dimensions) with width (x) of 512 voxels and
-    height (y) of 256 voxels with offset (0,0,100) in PNG format.
-
-    Throttling can be enabled by passing a "throttle=true" query string.  Throttling makes sure
-    only one compute-intense operation (all API calls that can be throttled) is handled.
-    If the server can't initiate the API call right away, a 503 (Service Unavailable) status
-    code is returned.
+    Returns an isotropic XY slice (0th and 1st dimensions) with width (x) of 512 voxels and
+    height (y) of 256 voxels with offset (0,0,100) in JPG format with quality 80.
+    Additional processing is applied based on voxel resolutions to make sure the retrieved image 
+    has isotropic pixels.  For example, if an XZ image is requested and the image volume has 
+    X resolution 3 nm and Z resolution 40 nm, the returned image's height will be magnified 40/3
+    relative to the raw data.
+    The example offset assumes the "grayscale" data in version node "3f8c" is 3d.
+    The "Content-type" of the HTTP response should agree with the requested format.
+    For example, returned PNGs will have "Content-type" of "image/png", and returned
+    nD data will be "application/octet-stream".
 
     Arguments:
 
@@ -176,15 +173,98 @@ POST <api URL>/node/<UUID>/<data name>/raw/<dims>/<size>/<offset>[/<format>][?th
                     Slice strings ("xy", "xz", or "yz") are also accepted.
     size          Size in voxels along each dimension specified in <dims>.
     offset        Gives coordinate of first voxel using dimensionality of data.
+    format        Valid formats depend on the dimensionality of the request and formats
+                    available in server implementation.
+                  2D: "png", "jpg" (default: "png")
+                    jpg allows lossy quality setting, e.g., "jpg:80"
+                  nD: uses default "octet-stream".
 
     Query-string Options:
 
     roi       	  Name of roi data instance used to mask the requested data.
     compression   Allows retrieval or submission of 3d data in "lz4" and "gzip"
-                  compressed format.  The 2d data will ignore this and use
-                  the image-based codec.
+                    compressed format.  The 2d data will ignore this and use
+                    the image-based codec.
+    throttle      Only works for 3d data requests.  If "true", makes sure only N compute-intense operation 
+    				(all API calls that can be throttled) are handled.  If the server can't initiate the API 
+    				call right away, a 503 (Service Unavailable) status code is returned.
 
-GET  <api URL>/node/<UUID>/<data name>/pseudocolor/<dims>/<size>/<offset>[/<format>][?throttle=true]
+
+GET  <api URL>/node/<UUID>/<data name>/raw/<dims>/<size>/<offset>[/<format>][?queryopts]
+
+    Retrieves either 2d images (PNG by default) or 3d binary data, depending on the dims parameter.  
+    The 3d binary data response has "Content-type" set to "application/octet-stream" and is an array of 
+    voxel values in ZYX order (X iterates most rapidly).
+
+    Example: 
+
+    GET <api URL>/node/3f8c/segmentation/raw/0_1/512_256/0_0_100/jpg:80
+
+    Returns a raw XY slice (0th and 1st dimensions) with width (x) of 512 voxels and
+    height (y) of 256 voxels with offset (0,0,100) in JPG format with quality 80.
+    By "raw", we mean that no additional processing is applied based on voxel
+    resolutions to make sure the retrieved image has isotropic pixels.
+    The example offset assumes the "grayscale" data in version node "3f8c" is 3d.
+    The "Content-type" of the HTTP response should agree with the requested format.
+    For example, returned PNGs will have "Content-type" of "image/png", and returned
+    nD data will be "application/octet-stream". 
+
+    Arguments:
+
+    UUID          Hexidecimal string with enough characters to uniquely identify a version node.
+    data name     Name of data to add.
+    dims          The axes of data extraction in form "i_j_k,..."  
+                    Slice strings ("xy", "xz", or "yz") are also accepted.
+                    Example: "0_2" is XZ, and "0_1_2" is a 3d subvolume.
+    size          Size in voxels along each dimension specified in <dims>.
+    offset        Gives coordinate of first voxel using dimensionality of data.
+    format        Valid formats depend on the dimensionality of the request and formats
+                    available in server implementation.
+                  2D: "png", "jpg" (default: "png")
+                    jpg allows lossy quality setting, e.g., "jpg:80"
+                  nD: uses default "octet-stream".
+
+    Query-string Options:
+
+    roi           Name of roi data instance used to mask the requested data.
+    compression   Allows retrieval or submission of 3d data in "lz4" and "gzip"
+                    compressed format.  The 2d data will ignore this and use
+                    the image-based codec.
+    throttle      Only works for 3d data requests.  If "true", makes sure only N compute-intense operation 
+    				(all API calls that can be throttled) are handled.  If the server can't initiate the API 
+    				call right away, a 503 (Service Unavailable) status code is returned.
+
+
+POST <api URL>/node/<UUID>/<data name>/raw/0_1_2/<size>/<offset>[?queryopts]
+
+    Puts block-aligned voxel data using the block sizes defined for  this data instance.  
+    For example, if the BlockSize = 32, offset and size must by multiples of 32.
+
+    Example: 
+
+    POST <api URL>/node/3f8c/segmentation/raw/0_1_2/512_256_128/0_0_32
+
+    Arguments:
+
+    UUID          Hexidecimal string with enough characters to uniquely identify a version node.
+    data name     Name of data to add.
+    size          Size in voxels along each dimension specified in <dims>.
+    offset        Gives coordinate of first voxel using dimensionality of data.
+
+    Query-string Options:
+
+    roi           Name of roi data instance used to mask the requested data.
+    mutate        Default "false" corresponds to ingestion, i.e., the first write of the given block.
+                    Use "true" to indicate the POST is a mutation of prior data, which allows any
+                    synced data instance to cleanup prior denormalizations.  If "mutate=true", the
+                    POST operations will be slower due to a required GET to retrieve past data.
+    compression   Allows retrieval or submission of 3d data in "lz4" and "gzip"
+                    compressed format.
+    throttle      If "true", makes sure only N compute-intense operation (all API calls that can be throttled) 
+                    are handled.  If the server can't initiate the API call right away, a 503 (Service Unavailable) 
+                    status code is returned.
+
+GET  <api URL>/node/<UUID>/<data name>/pseudocolor/<dims>/<size>/<offset>[/<format>][?queryopts]
 
     Retrieves label data as pseudocolored 2D PNG color images where each label hashed to a different RGB.
 
@@ -194,11 +274,6 @@ GET  <api URL>/node/<UUID>/<data name>/pseudocolor/<dims>/<size>/<offset>[/<form
 
     Returns an XY slice (0th and 1st dimensions) with width (x) of 512 voxels and
     height (y) of 256 voxels with offset (0,0,100) in PNG format.
-
-    Throttling can be enabled by passing a "throttle=true" query string.  Throttling makes sure
-    only one compute-intense operation (all API calls that can be throttled) is handled.
-    If the server can't initiate the API call right away, a 503 (Service Unavailable) status
-    code is returned.
 
     Arguments:
 
@@ -212,6 +287,11 @@ GET  <api URL>/node/<UUID>/<data name>/pseudocolor/<dims>/<size>/<offset>[/<form
     Query-string Options:
 
     roi       	  Name of roi data instance used to mask the requested data.
+    compression   Allows retrieval or submission of 3d data in "lz4" and "gzip"
+                    compressed format.
+    throttle      If "true", makes sure only N compute-intense operation (all API calls that can be throttled) 
+                    are handled.  If the server can't initiate the API call right away, a 503 (Service Unavailable) 
+                    status code is returned.
 
 GET <api URL>/node/<UUID>/<data name>/label/<coord>
 
@@ -835,6 +915,93 @@ func colorImage(labels *dvid.Image) (image.Image, error) {
 	return dst, nil
 }
 
+func sendBinaryData(compression string, data []byte, w http.ResponseWriter) error {
+	var err error
+	w.Header().Set("Content-type", "application/octet-stream")
+	switch compression {
+	case "":
+		_, err = w.Write(data)
+		if err != nil {
+			return err
+		}
+	case "lz4":
+		compressed := make([]byte, lz4.CompressBound(data))
+		var n, outSize int
+		if outSize, err = lz4.Compress(data, compressed); err != nil {
+			return err
+		}
+		compressed = compressed[:outSize]
+		if n, err = w.Write(compressed); err != nil {
+			return err
+		}
+		if n != outSize {
+			errmsg := fmt.Sprintf("Only able to write %d of %d lz4 compressed bytes\n", n, outSize)
+			dvid.Errorf(errmsg)
+			return err
+		}
+	case "gzip":
+		gw := gzip.NewWriter(w)
+		if _, err = gw.Write(data); err != nil {
+			return err
+		}
+		if err = gw.Close(); err != nil {
+			return err
+		}
+	default:
+		return fmt.Errorf("unknown compression type %q", compression)
+	}
+	return nil
+}
+
+func getBinaryData(compression string, in io.ReadCloser, estsize int64) ([]byte, error) {
+	var err error
+	var data []byte
+	switch compression {
+	case "":
+		tlog := dvid.NewTimeLog()
+		data, err = ioutil.ReadAll(in)
+		if err != nil {
+			return nil, err
+		}
+		tlog.Debugf("read 3d uncompressed POST")
+	case "lz4":
+		tlog := dvid.NewTimeLog()
+		data, err = ioutil.ReadAll(in)
+		if err != nil {
+			return nil, err
+		}
+		if len(data) == 0 {
+			return nil, fmt.Errorf("received 0 LZ4 compressed bytes")
+		}
+		tlog.Debugf("read 3d lz4 POST")
+		tlog = dvid.NewTimeLog()
+		uncompressed := make([]byte, estsize)
+		err = lz4.Uncompress(data, uncompressed)
+		if err != nil {
+			return nil, err
+		}
+		data = uncompressed
+		tlog.Debugf("uncompressed 3d lz4 POST")
+	case "gzip":
+		tlog := dvid.NewTimeLog()
+		gr, err := gzip.NewReader(in)
+		if err != nil {
+			return nil, err
+		}
+		data, err = ioutil.ReadAll(gr)
+		if err != nil {
+			return nil, err
+		}
+		if err = gr.Close(); err != nil {
+			return nil, err
+		}
+		tlog.Debugf("read and uncompress 3d gzip POST")
+	default:
+		return nil, fmt.Errorf("unknown compression type %q", compression)
+	}
+	return data, nil
+}
+
 // ServeHTTP handles all incoming HTTP requests for this data.
 func (d *Data) ServeHTTP(uuid dvid.UUID, ctx *datastore.VersionedCtx, w http.ResponseWriter, r *http.Request) {
 	// TODO -- Refactor this method to break it up and make it simpler.  Use the web routing for the endpoints.
@@ -860,12 +1027,8 @@ func (d *Data) ServeHTTP(uuid dvid.UUID, ctx *datastore.VersionedCtx, w http.Res
 	}
 
 	// Get query strings and possible roi
-	var roiptr *imageblk.ROI
-	queryValues := r.URL.Query()
-	roiname := dvid.InstanceName(queryValues.Get("roi"))
-	if len(roiname) != 0 {
-		roiptr = new(imageblk.ROI)
-	}
+	queryStrings := r.URL.Query()
+	roiname := dvid.InstanceName(queryStrings.Get("roi"))
 
 	// Handle POST on data -> setting of configuration
 	if len(parts) == 3 && action == "post" {
@@ -1024,14 +1187,7 @@ func (d *Data) ServeHTTP(uuid dvid.UUID, ctx *datastore.VersionedCtx, w http.Res
 				server.BadRequest(w, r, err)
 				return
 			}
-			if roiptr != nil {
-				roiptr.Iter, err = roi.NewIterator(roiname, ctx.VersionID(), lbl)
-				if err != nil {
-					server.BadRequest(w, r, err)
-					return
-				}
-			}
-			img, err := d.GetImage(ctx.VersionID(), lbl, roiptr)
+			img, err := d.GetImage(ctx.VersionID(), lbl, roiname)
 			if err != nil {
 				server.BadRequest(w, r, err)
 				return
@@ -1090,14 +1246,7 @@ func (d *Data) ServeHTTP(uuid dvid.UUID, ctx *datastore.VersionedCtx, w http.Res
 				server.BadRequest(w, r, err)
 				return
 			}
-			if roiptr != nil {
-				roiptr.Iter, err = roi.NewIterator(roiname, ctx.VersionID(), lbl)
-				if err != nil {
-					server.BadRequest(w, r, err)
-					return
-				}
-			}
-			img, err := d.GetImage(ctx.VersionID(), lbl, roiptr)
+			img, err := d.GetImage(ctx.VersionID(), lbl, roiname)
 			if err != nil {
 				server.BadRequest(w, r, err)
 				return
@@ -1123,23 +1272,13 @@ func (d *Data) ServeHTTP(uuid dvid.UUID, ctx *datastore.VersionedCtx, w http.Res
 			}
 			timedLog.Infof("HTTP %s: %s (%s)", r.Method, plane, r.URL)
 		case 3:
-			queryStrings := r.URL.Query()
-			throttle := queryStrings.Get("throttle")
-			if throttle == "true" || throttle == "on" {
-				select {
-				case <-server.Throttle:
-					// Proceed with operation, returning throttle token to server at end.
-					defer func() {
-						server.Throttle <- 1
-					}()
-				default:
-					throttleMsg := fmt.Sprintf("Server already running maximum of %d throttled operations",
-						server.MaxThrottledOps)
-					http.Error(w, throttleMsg, http.StatusServiceUnavailable)
+			if queryStrings.Get("throttle") == "on" {
+				if server.ThrottledHTTP(w) {
 					return
 				}
+				defer server.ThrottledOpDone()
 			}
-			compression := queryValues.Get("compression")
+			compression := queryStrings.Get("compression")
 			subvol, err := dvid.NewSubvolumeFromStrings(offsetStr, sizeStr, "_")
 			if err != nil {
 				server.BadRequest(w, r, err)
@@ -1151,56 +1290,13 @@ func (d *Data) ServeHTTP(uuid dvid.UUID, ctx *datastore.VersionedCtx, w http.Res
 					server.BadRequest(w, r, err)
 					return
 				}
-				if roiptr != nil {
-					roiptr.Iter, err = roi.NewIterator(roiname, ctx.VersionID(), lbl)
-					if err != nil {
-						server.BadRequest(w, r, err)
-						return
-					}
-				}
-				data, err := d.GetVolume(ctx.VersionID(), lbl, roiptr)
+				data, err := d.GetVolume(ctx.VersionID(), lbl, roiname)
 				if err != nil {
 					server.BadRequest(w, r, err)
 					return
 				}
-				w.Header().Set("Content-type", "application/octet-stream")
-				switch compression {
-				case "":
-					_, err = w.Write(data)
-					if err != nil {
-						server.BadRequest(w, r, err)
-						return
-					}
-				case "lz4":
-					compressed := make([]byte, lz4.CompressBound(data))
-					var n, outSize int
-					if outSize, err = lz4.Compress(data, compressed); err != nil {
-						server.BadRequest(w, r, err)
-						return
-					}
-					compressed = compressed[:outSize]
-					if n, err = w.Write(compressed); err != nil {
-						server.BadRequest(w, r, err)
-						return
-					}
-					if n != outSize {
-						errmsg := fmt.Sprintf("Only able to write %d of %d lz4 compressed bytes\n", n, outSize)
-						dvid.Errorf(errmsg)
-						server.BadRequest(w, r, errmsg)
-						return
-					}
-				case "gzip":
-					gw := gzip.NewWriter(w)
-					if _, err = gw.Write(data); err != nil {
-						server.BadRequest(w, r, err)
-						return
-					}
-					if err = gw.Close(); err != nil {
-						server.BadRequest(w, r, err)
-						return
-					}
-				default:
-					server.BadRequest(w, r, "unknown compression type %q", compression)
+				if err := sendBinaryData(compression, data, w); err != nil {
+					server.BadRequest(w, r, err)
 					return
 				}
 			} else {
@@ -1208,62 +1304,15 @@ func (d *Data) ServeHTTP(uuid dvid.UUID, ctx *datastore.VersionedCtx, w http.Res
 					server.BadRequest(w, r, "can only POST 'raw' not 'isotropic' images")
 					return
 				}
-				// Make sure vox is block-aligned
+				// Make sure posted subvolume is block-aligned
 				if !dvid.BlockAligned(subvol, d.BlockSize()) {
 					server.BadRequest(w, r, "cannot store labels in non-block aligned geometry %s -> %s", subvol.StartPoint(), subvol.EndPoint())
 					return
 				}
-
-				var data []byte
-				switch compression {
-				case "":
-					tlog := dvid.NewTimeLog()
-					data, err = ioutil.ReadAll(r.Body)
-					if err != nil {
-						server.BadRequest(w, r, err)
-						return
-					}
-					tlog.Debugf("read 3d uncompressed POST")
-				case "lz4":
-					tlog := dvid.NewTimeLog()
-					data, err = ioutil.ReadAll(r.Body)
-					if err != nil {
-						server.BadRequest(w, r, err)
-						return
-					}
-					if len(data) == 0 {
-						server.BadRequest(w, r, "received 0 LZ4 compressed bytes")
-						return
-					}
-					tlog.Debugf("read 3d lz4 POST")
-					tlog = dvid.NewTimeLog()
-					uncompressed := make([]byte, subvol.NumVoxels()*8)
-					err = lz4.Uncompress(data, uncompressed)
-					if err != nil {
-						server.BadRequest(w, r, err)
-						return
-					}
-					data = uncompressed
-					tlog.Debugf("uncompressed 3d lz4 POST")
-				case "gzip":
-					tlog := dvid.NewTimeLog()
-					gr, err := gzip.NewReader(r.Body)
-					if err != nil {
-						server.BadRequest(w, r, err)
-						return
-					}
-					data, err = ioutil.ReadAll(gr)
-					if err != nil {
-						server.BadRequest(w, r, err)
-						return
-					}
-					if err = gr.Close(); err != nil {
-						server.BadRequest(w, r, err)
-						return
-					}
-					tlog.Debugf("read and uncompress 3d gzip POST")
-				default:
-					server.BadRequest(w, r, "unknown compression type %q", compression)
+				estsize := subvol.NumVoxels() * 8
+				data, err := getBinaryData(compression, r.Body, estsize)
+				if err != nil {
+					server.BadRequest(w, r, err)
 					return
 				}
 				lbl, err := d.NewLabels(subvol, data)
@@ -1271,16 +1320,16 @@ func (d *Data) ServeHTTP(uuid dvid.UUID, ctx *datastore.VersionedCtx, w http.Res
 					server.BadRequest(w, r, err)
 					return
 				}
-				if roiptr != nil {
-					roiptr.Iter, err = roi.NewIterator(roiname, ctx.VersionID(), lbl)
-					if err != nil {
+				if queryStrings.Get("mutate") == "true" {
+					if err = d.MutateVoxels(ctx.VersionID(), lbl.Voxels, roiname); err != nil {
 						server.BadRequest(w, r, err)
 						return
 					}
-				}
-				if err = d.PutVoxels(ctx.VersionID(), lbl.Voxels, roiptr); err != nil {
-					server.BadRequest(w, r, err)
-					return
+				} else {
+					if err = d.IngestVoxels(ctx.VersionID(), lbl.Voxels, roiname); err != nil {
+						server.BadRequest(w, r, err)
+						return
+					}
 				}
 			}
 			timedLog.Infof("HTTP %s: %s (%s)", r.Method, subvol, r.URL)

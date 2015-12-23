@@ -130,6 +130,10 @@ else ()
         DEPENDS     gopackages-install
         WORKING_DIRECTORY $ENV{GOPATH}/src/github.com/janelia-flyem/go
         COMMENT     "Updating required Go packages...")
+
+    # add_custom_target (goprotobuf
+    #     ${BUILDEM_ENV_STRING} go get ${GO_GET} -u github.com/golang/protobuf/{proto,protoc-gen-go}
+    #     COMMENT     "Adding goprotobuf support...")
     
     add_custom_target (gojsonschema
         ${BUILDEM_ENV_STRING} go get ${GO_GET} github.com/janelia-flyem/gojsonschema
@@ -205,10 +209,11 @@ else ()
     add_custom_target (dvid
         ${BUILDEM_ENV_STRING} nrsc ${BUILDEM_BIN_DIR}/dvid dvid-console
         WORKING_DIRECTORY   ${BUILDEM_DIR}/src
-        DEPENDS     dvid-exe nrsc dvid-console dvid-backup
-        COMMENT     "Adding embedded console into dvid executable...")
+        DEPENDS     dvid-exe nrsc dvid-console dvid-backup dvid-transfer
+        COMMENT     "Adding embedded console into dvid executable..."
+    )
 
-    set (DVID_PACKAGES ${DVID_GO}/dvid ${DVID_GO}/storage/... ${DVID_GO}/datastore ${DVID_GO}/server
+   set (DVID_PACKAGES ${DVID_GO}/dvid ${DVID_GO}/storage/... ${DVID_GO}/datastore ${DVID_GO}/server
                        ${DVID_GO}/datatype/... ${DVID_GO}/tests_integration)
 
    add_custom_target (test
@@ -239,6 +244,13 @@ else ()
         -v -tags '${DVID_BACKEND} ${DVID_GRAPHBACKEND} ${DVID_BUILD_TAGS}' cmd/backup/main.go 
         WORKING_DIRECTORY   ${CMAKE_CURRENT_SOURCE_DIR}
         COMMENT     "Compiling and installing dvid backup command...")
+
+    # Build transfer command 
+    add_custom_target (dvid-transfer
+        ${BUILDEM_ENV_STRING} ${GO_ENV} ${CGO_FLAGS} go build -o ${BUILDEM_BIN_DIR}/dvid-transfer 
+        -v -tags '${DVID_BACKEND} ${DVID_GRAPHBACKEND} ${DVID_BUILD_TAGS}' cmd/transfer/*.go
+        WORKING_DIRECTORY   ${CMAKE_CURRENT_SOURCE_DIR}
+        COMMENT     "Compiling and installing dvid transfer command...")
 
     ###############################################################################
 endif()

@@ -58,6 +58,8 @@ func (v *Voxels) ReadBlock(block *storage.TKeyValue, blockSize dvid.Point, atten
 	return v.readBlock(block, blockSize)
 }
 
+// readScaledBlock reads the possibly intersecting block data into the receiver Voxels and applies an attenuation
+// to the values.
 func (v *Voxels) readScaledBlock(block *storage.TKeyValue, blockSize dvid.Point, attenuation uint8) error {
 	if blockSize.NumDims() > 3 {
 		return fmt.Errorf("DVID voxel blocks currently only supports up to 3d, not 4+ dimensions")
@@ -149,6 +151,7 @@ func (v *Voxels) readScaledBlock(block *storage.TKeyValue, blockSize dvid.Point,
 	return nil
 }
 
+// readBlock reads the possibly intersecting block data into the receiver Voxels.
 func (v *Voxels) readBlock(block *storage.TKeyValue, blockSize dvid.Point) error {
 	if blockSize.NumDims() > 3 {
 		return fmt.Errorf("DVID voxel blocks currently only supports up to 3d, not 4+ dimensions")
@@ -259,6 +262,27 @@ func (v *Voxels) littleToBigEndian(data []uint8) (bigendian []uint8, err error) 
 	return
 }
 
+// GetROI returns an imageblk.ROI that can iterate over the provided Voxels
+// unless roiname is empty, which prompts a nil ROI returned.
+func GetROI(v dvid.VersionID, roiname dvid.InstanceName, bnd dvid.Bounder) (*ROI, error) {
+	if roiname != "" {
+		r := new(ROI)
+		var err error
+		r.Iter, err = roi.NewIterator(roiname, v, bnd)
+		if err != nil {
+			return nil, err
+		}
+		return r, nil
+	}
+	return nil, nil
+}
+
+func (d *Data) AllocateBlock() []byte {
+	numElements := d.BlockSize().Prod()
+	bytesPerElement := int64(d.Values.BytesPerElement())
+	return make([]byte, numElements*bytesPerElement)
+}
+
 // BackgroundBlock returns a block buffer that has been preinitialized to the background value.
 func (d *Data) BackgroundBlock() []byte {
 	numElements := d.BlockSize().Prod()
@@ -274,16 +298,16 @@ func (d *Data) BackgroundBlock() []byte {
 }
 
 // GetImage retrieves a 2d image from a version node given a geometry of voxels.
-func (d *Data) GetImage(v dvid.VersionID, vox *Voxels, r *ROI) (*dvid.Image, error) {
-	if err := d.GetVoxels(v, vox, r); err != nil {
+func (d *Data) GetImage(v dvid.VersionID, vox *Voxels, roiname dvid.InstanceName) (*dvid.Image, error) {
+	if err := d.GetVoxels(v, vox, roiname); err != nil {
 		return nil, err
 	}
 	return vox.GetImage2d()
 }
 
 // GetVolume retrieves a n-d volume from a version node given a geometry of voxels.
-func (d *Data) GetVolume(v dvid.VersionID, vox *Voxels, r *ROI) ([]byte, error) {
-	if err := d.GetVoxels(v, vox, r); err != nil {
+func (d *Data) GetVolume(v dvid.VersionID, vox *Voxels, roiname dvid.InstanceName) ([]byte, error) {
+	if err := d.GetVoxels(v, vox, roiname); err != nil {
 		return nil, err
 	}
 	return vox.Data(), nil
@@ -296,7 +320,12 @@ type getOperation struct {
 }
 
 // GetVoxels copies voxels from the storage engine to Voxels, a requested subvolume or 2d image.
-func (d *Data) GetVoxels(v dvid.VersionID, vox *Voxels, r *ROI) error {
+func (d *Data) GetVoxels(v dvid.VersionID, vox *Voxels, roiname dvid.InstanceName) error {
+	r, err := GetROI(v, roiname, vox)
+	if err != nil {
+		return err
+	}
+
 	timedLog := dvid.NewTimeLog()
 	defer timedLog.Infof("GetVoxels %s", vox)
 
@@ -441,7 +470,26 @@ func xferBlock(buf []byte, chunk *storage.Chunk, wg *sync.WaitGroup) {
 	copy(buf, block)
 }
 
-// Loads blocks with old data if they exist.
+// load block of data from storage
+func (d *Data) loadOldBlock(v dvid.VersionID, k storage.TKey) ([]byte, error) {
+	store, err := storage.MutableStore()
+	if err != nil {
+		return nil, fmt.Errorf("Data type imageblk had error initializing store: %v\n", err)
+	}
+
+	ctx := datastore.NewVersionedCtx(d, v)
+	serialization, err := store.Get(ctx, k)
+	if err != nil {
+		return nil, err
+	}
+	data, _, err := dvid.DeserializeData(serialization, true)
+	if err != nil {
+		return nil, fmt.Errorf("Unable to deserialize block, %s: %v", ctx, err)
+	}
+	return data, err
+}
+
+// loads blocks with old data if they exist.
 func (d *Data) loadOldBlocks(v dvid.VersionID, vox *Voxels, blocks storage.TKeyValues) error {
 	store, err := storage.MutableStore()
 	if err != nil {

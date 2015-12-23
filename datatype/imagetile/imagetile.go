@@ -64,7 +64,7 @@ $ dvid repo <UUID> new imagetile <data name> <settings...>
                       tile request time and is a better choice if you primarily ask for arbitrary sized images
                       (via GET .../raw/... or .../isotropic/...) instead of tiles (via GET .../tile/...)
     Versioned      "true" or "false" (default)
-    Source         Name of data source (required)
+    Source         Name of uint8blk data instance if using the tile "generate" command below.
     Placeholder    Bool ("false", "true", "0", or "1").  Return placeholder tile if missing.
 
 
@@ -134,14 +134,35 @@ GET  <api URL>/node/<UUID>/<data name>/info
     data name     Name of imagetile data.
 
 
+GET  <api URL>/node/<UUID>/<data name>/metadata
+
+	Gets the resolution and expected tile sizes for stored tiles.   See the POST action on this endpoint
+	for further documentation.
+
 POST <api URL>/node/<UUID>/<data name>/metadata
 
 	Sets the resolution and expected tile sizes for stored tiles.   This should be used in conjunction
 	with POST to the tile endpoints to populate an imagetile data instance with externally generated
-	data.
+	data.  For example POST payload, see the sample config.json above in "generate" command line.
 
 	Note that until metadata is set, any call to the "raw" or "isotropic" endpoints will return
 	a status code 400 (Bad Request) and a message that the metadata needs to be set.
+
+	Metadata should be JSON in the following format:
+	{
+		"MinTileCoord": [0, 0, 0],
+		"MaxTileCoord": [5, 5, 4],
+		"Levels": {
+		    "0": {  "Resolution": [10.0, 10.0, 10.0], "TileSize": [512, 512, 512] },
+		    "1": {  "Resolution": [20.0, 20.0, 20.0], "TileSize": [512, 512, 512] },
+		    "2": {  "Resolution": [40.0, 40.0, 40.0], "TileSize": [512, 512, 512] },
+		    "3": {  "Resolution": [80.0, 80.0, 80.0], "TileSize": [512, 512, 512] }
+		}
+	}
+
+	where "MinTileCoord" and "MaxTileCoord" are the minimum and maximum tile coordinates,
+	thereby defining the extent of the tiled volume when coupled with level "0" tile sizes.
+
 
 GET  <api URL>/node/<UUID>/<data name>/tile/<dims>/<scaling>/<tile coord>[?noblanks=true]
 POST
@@ -413,7 +434,36 @@ func LoadTileSpec(jsonBytes []byte) (TileSpec, error) {
 	if err != nil {
 		return nil, err
 	}
+	return parseTileSpec(config)
+}
 
+type metadataJSON struct {
+	MinTileCoord dvid.Point3d
+	MaxTileCoord dvid.Point3d
+	Levels       specJSON
+}
+
+// SetMetadata loads JSON data giving MinTileCoord, MaxTileCoord, and tile level specifications.
+func (d *Data) SetMetadata(uuid dvid.UUID, jsonBytes []byte) error {
+	var config metadataJSON
+	if err := json.Unmarshal(jsonBytes, &config); err != nil {
+		return err
+	}
+	tileSpec, err := parseTileSpec(config.Levels)
+	if err != nil {
+		return err
+	}
+
+	d.Levels = tileSpec
+	d.MinTileCoord = config.MinTileCoord
+	d.MaxTileCoord = config.MaxTileCoord
+	if err := datastore.SaveDataByUUID(uuid, d); err != nil {
+		return err
+	}
+	return nil
+}
+
+func parseTileSpec(config specJSON) (TileSpec, error) {
 	// Allocate the tile specs
 	numLevels := len(config)
 	specs := make(TileSpec, numLevels)
@@ -498,8 +548,15 @@ var DefaultTileSize = dvid.Point3d{512, 512, 512}
 // Properties are additional properties for keyvalue data instances beyond those
 // in standard datastore.Data.   These will be persisted to metadata storage.
 type Properties struct {
-	// Source of the data for these imagetile.
+	// Source of the data for these imagetile.  Could be blank if tiles are not generated from
+	// an associated grayscale data instance, but were loaded directly from external processing.
 	Source dvid.InstanceName
+
+	// MinTileCoord gives the minimum tile coordinate.
+	MinTileCoord dvid.Point3d
+
+	// MaxTileCoord gives the maximum tile coordinate.
+	MaxTileCoord dvid.Point3d
 
 	// Levels describe the resolution and tile sizes at each level of resolution.
 	Levels TileSpec
@@ -732,13 +789,7 @@ func (d *Data) ServeHTTP(uuid dvid.UUID, ctx *datastore.VersionedCtx, w http.Res
 				server.BadRequest(w, r, err)
 				return
 			}
-			tilespec, err := LoadTileSpec(jsonBytes)
-			if err != nil {
-				server.BadRequest(w, r, err)
-				return
-			}
-			d.Levels = tilespec
-			if err := datastore.SaveDataByUUID(uuid, d); err != nil {
+			if err := d.SetMetadata(uuid, jsonBytes); err != nil {
 				server.BadRequest(w, r, err)
 				return
 			}
@@ -748,7 +799,16 @@ func (d *Data) ServeHTTP(uuid dvid.UUID, ctx *datastore.VersionedCtx, w http.Res
 				server.BadRequest(w, r, "tile metadata for imagetile %q was not set\n", d.DataName())
 				return
 			}
-			jsonBytes, err := d.Levels.MarshalJSON()
+			metadata := struct {
+				MinTileCoord dvid.Point3d
+				MaxTileCoord dvid.Point3d
+				Levels       TileSpec
+			}{
+				d.MinTileCoord,
+				d.MaxTileCoord,
+				d.Levels,
+			}
+			jsonBytes, err := json.Marshal(metadata)
 			if err != nil {
 				server.BadRequest(w, r, err)
 				return
@@ -954,8 +1014,8 @@ func (d *Data) ServeTile(ctx storage.Context, w http.ResponseWriter, r *http.Req
 	}
 	tileReq, err := d.ParseTileReq(r, parts)
 
-	queryValues := r.URL.Query()
-	noblanksStr := dvid.InstanceName(queryValues.Get("noblanks"))
+	queryStrings := r.URL.Query()
+	noblanksStr := dvid.InstanceName(queryStrings.Get("noblanks"))
 	var noblanks bool
 	if noblanksStr == "true" {
 		noblanks = true
@@ -1207,12 +1267,6 @@ func (d *Data) ConstructTiles(uuidStr string, tileSpec TileSpec, request datasto
 		return fmt.Errorf("Cannot construct imagetile for non-voxels data: %s", d.Source)
 	}
 
-	// Save the current tile specification
-	d.Levels = tileSpec
-	if err := datastore.SaveDataByUUID(uuid, d); err != nil {
-		return err
-	}
-
 	// Get size of tile at lowest resolution.
 	lastLevel := Scaling(len(tileSpec) - 1)
 	loresSpec, found := tileSpec[lastLevel]
@@ -1243,12 +1297,18 @@ func (d *Data) ConstructTiles(uuidStr string, tileSpec TileSpec, request datasto
 	for i := 0; i < 3; i++ {
 		minInt, _ := math.Modf(minPtDist[i] / loresSize[i])
 		maxInt, _ := math.Modf(maxPtDist[i] / loresSize[i])
-		minTileCoord := int32(minInt)
-		maxTileCoord := int32(maxInt)
-		minTiledPt[i] = minTileCoord * DefaultTileSize[i] * loresMag[i]
-		maxTiledPt[i] = (maxTileCoord+1)*DefaultTileSize[i]*loresMag[i] - 1
+		d.MinTileCoord[i] = int32(minInt)
+		d.MaxTileCoord[i] = int32(maxInt)
+		minTiledPt[i] = d.MinTileCoord[i] * DefaultTileSize[i] * loresMag[i]
+		maxTiledPt[i] = (d.MaxTileCoord[i]+1)*DefaultTileSize[i]*loresMag[i] - 1
 	}
 	sizeVolume := maxTiledPt.Sub(minTiledPt).AddScalar(1)
+
+	// Save the current tile specification
+	d.Levels = tileSpec
+	if err := datastore.SaveDataByUUID(uuid, d); err != nil {
+		return err
+	}
 
 	// Setup swappable ExtData buffers (the stitched slices) so we can be generating tiles
 	// at same time we are reading and stitching them.
@@ -1326,7 +1386,7 @@ func (d *Data) ConstructTiles(uuidStr string, tileSpec TileSpec, request datasto
 				if err != nil {
 					return err
 				}
-				if err = src.GetVoxels(versionID, sliceBuffers[bufferNum], nil); err != nil {
+				if err = src.GetVoxels(versionID, sliceBuffers[bufferNum], ""); err != nil {
 					return err
 				}
 				// Iterate through the different scales, extracting tiles at each resolution.
@@ -1387,7 +1447,7 @@ func (d *Data) ConstructTiles(uuidStr string, tileSpec TileSpec, request datasto
 				if err != nil {
 					return err
 				}
-				if err = src.GetVoxels(versionID, sliceBuffers[bufferNum], nil); err != nil {
+				if err = src.GetVoxels(versionID, sliceBuffers[bufferNum], ""); err != nil {
 					return err
 				}
 				// Iterate through the different scales, extracting tiles at each resolution.
@@ -1448,7 +1508,7 @@ func (d *Data) ConstructTiles(uuidStr string, tileSpec TileSpec, request datasto
 				if err != nil {
 					return err
 				}
-				if err = src.GetVoxels(versionID, sliceBuffers[bufferNum], nil); err != nil {
+				if err = src.GetVoxels(versionID, sliceBuffers[bufferNum], ""); err != nil {
 					return err
 				}
 				// Iterate through the different scales, extracting tiles at each resolution.
